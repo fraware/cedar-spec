@@ -1,5 +1,57 @@
 # Cedar Benchmarking
 
+## Permission-query baseline
+
+The standalone `permission_query_baseline` experiment measures Cedar's
+experimental `PolicySet::query_resource` against exhaustive concrete
+authorization over **the same candidate resources and entity snapshot**.
+
+```bash
+cargo run --release --bin permission_query_baseline -- \
+  --sizes 100,1000,10000 --trials 30 --warmups 3
+```
+
+The experiment generates deterministic in-memory entities and validates its
+Cedar policy set. It checks equality of the **entire authorized-resource set**
+before measurement and on every timed trial. The five reported measurements
+are:
+
+- `query_resource`: one resource-permission query, including Cedar's internal
+  clone and conversion of the entity store.
+- `exhaustive_authorization`: one concrete authorization call per candidate,
+  with each `Request` constructed inside the timed region.
+- `exhaustive_prebuilt_requests`: the same concrete calls, with `Request`
+  objects constructed before timing.
+- `concrete_entities_clone`: clone the complete concrete `Entities` store.
+- `partial_entities_from_concrete`: clone the concrete store **and** convert
+  it to validated `PartialEntities` through the public TPE API.
+
+Each method reports mean, median and p95 microseconds for a **whole candidate
+set or whole-store transformation**, not per individual request. The benchmark
+rotates the execution order to mitigate systematic ordering effects. JSON
+output also records the Cedar SDK version and host architecture/OS.
+
+### Measurement boundaries
+
+Data generation, policy parsing, schema validation, and candidate ID creation
+occur outside the timed region. The resource-query object is preconstructed.
+The two concrete-authorization paths use the same `PolicySet`, `Entities`
+and candidates. The component timers independently measure clone or
+clone-plus-conversion; they do **not** prove that these timings are strictly
+additive or that eliminating conversion saves exactly the same amount.
+
+This is a controlled **in-memory synthetic baseline**, not a database
+performance benchmark or proof of an improved algorithm. Policies are fixed,
+the entity graph is flat, request counts vary, and no database/network I/O is
+modeled. A hosted runner can introduce CPU and allocator variance. Compare
+identical pinned source revisions, build modes and hardware before drawing
+conclusions, and repeat on representative policy/entity graph structures.
+
+The Cedar `tpe` API is experimental. Its behavior and overhead may differ
+between SDK versions.
+
+---
+
 A command-line tool for benchmarking the [Cedar](https://www.cedarpolicy.com/) policy language. It measures the performance of core Cedar operations (parsing, validation, authorization) across a corpus of policy sets and schemas, outputting structured JSON results.
 You can use your own set of benchmarks, or test on the provided one in `corpus/`, for example:
 

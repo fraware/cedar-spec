@@ -24,7 +24,7 @@ jobs:
       - name: Checkout cedar-spec
         uses: actions/checkout@v7
         with:
-          repository: cedar-policy/cedar-spec
+          repository: ${{ github.repository }}
           ref: ${{ inputs.cedar_spec_ref }}
           path: ./cedar-spec
       - name: checkout cedar

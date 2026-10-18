@@ -9,6 +9,7 @@ keywords = ["cedar", "authorization", "benchmark", "performance"]
 categories = ["command-line-utilities", "development-tools::profiling"]
 description = "Benchmarking tool for the Cedar policy language"
 publish = false
+default-run = "cedar-benchmarking"
 
 [[bin]]
 name = "cedar-benchmarking"
@@ -53,6 +54,7 @@ large_enum_variant = "allow"
 arbitrary = "1.4"
 cedar-policy = { version = "4", path = "../cedar/cedar-policy", features = [
     "protobufs",
+    "tpe",
 ] }
 cedar-policy-core = { version = "4", path = "../cedar/cedar-policy-core" }
 cedar-policy-generators = { version = "4", path = "../cedar-policy-generators", features = [

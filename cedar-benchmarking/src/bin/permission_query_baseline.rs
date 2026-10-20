@@ -21,9 +21,9 @@
 //! It measures two existing Cedar API paths against the same entity snapshot.
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, EntityUid, PartialEntities, PolicySet,
-    PreparedResourceQueryEntities, Request, ResourceQueryRequest, Schema, ValidationMode,
-    Validator,
+    Authorizer, BorrowedPreparedResourceQueryEntities, Context, Decision, Entities, EntityUid,
+    PartialEntities, PolicySet, PreparedResourceQueryEntities, Request, ResourceQueryRequest,
+    Schema, ValidationMode, Validator,
 };
 use clap::Parser;
 use serde::Serialize;
@@ -95,6 +95,10 @@ struct Args {
     /// Untimed warm-up iterations for each method.
     #[arg(long, default_value_t = 3)]
     warmups: usize,
+
+    /// Measure just one snapshot constructor in a fresh process: owned or borrowed.
+    #[arg(long)]
+    snapshot_memory_mode: Option<String>,
 }
 
 #[derive(Debug)]
@@ -196,6 +200,15 @@ fn query_resources_prepared(
         .collect())
 }
 
+fn query_resources_prepared_borrowed(
+    f: &Fixture,
+    prepared: &BorrowedPreparedResourceQueryEntities<'_>,
+) -> ExperimentResult<BTreeSet<EntityUid>> {
+    Ok(f.policies
+        .query_resource_prepared_borrowed(&f.query, prepared)?
+        .collect())
+}
+
 fn individually_authorize(f: &Fixture) -> ExperimentResult<BTreeSet<EntityUid>> {
     let authorizer = Authorizer::new();
     let mut allowed = BTreeSet::new();
@@ -269,7 +282,9 @@ struct Row {
     trials: usize,
     query_resource: TimingSummary,
     query_resource_prepared: TimingSummary,
+    query_resource_prepared_borrowed: TimingSummary,
     snapshot_preparation_us: f64,
+    borrowed_snapshot_preparation_us: f64,
     rss_before_preparation_kib: Option<u64>,
     rss_after_preparation_kib: Option<u64>,
     exhaustive_authorization: TimingSummary,
@@ -294,9 +309,17 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
     let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())?;
     let snapshot_preparation_us = preparation_start.elapsed().as_secs_f64() * 1_000_000.0;
     let rss_after_preparation_kib = process_rss_kib();
+    let borrowed_start = Instant::now();
+    let prepared_borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)?;
+    let borrowed_snapshot_preparation_us = borrowed_start.elapsed().as_secs_f64() * 1_000_000.0;
     let reference = individually_authorize(&f)?;
     if individually_authorize_prebuilt(&f) != reference {
         return Err(io::Error::other("prepared and constructed requests disagree").into());
+    }
+    if query_resources_prepared_borrowed(&f, &prepared_borrowed)? != reference {
+        return Err(
+            io::Error::other("borrowed prepared query disagrees with authorization").into(),
+        );
     }
     if query_resources_prepared(&f, &prepared)? != reference {
         return Err(
@@ -312,6 +335,7 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
     for _ in 0..warmups {
         black_box(query_resources(&f)?);
         black_box(query_resources_prepared(&f, &prepared)?);
+        black_box(query_resources_prepared_borrowed(&f, &prepared_borrowed)?);
         black_box(individually_authorize(&f)?);
         black_box(individually_authorize_prebuilt(&f));
         black_box(f.entities.clone());
@@ -323,6 +347,7 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
 
     let mut query_samples = Vec::with_capacity(trials);
     let mut prepared_samples = Vec::with_capacity(trials);
+    let mut borrowed_samples = Vec::with_capacity(trials);
     let mut exhaustive_samples = Vec::with_capacity(trials);
     let mut prebuilt_samples = Vec::with_capacity(trials);
     let mut clone_samples = Vec::with_capacity(trials);
@@ -391,7 +416,24 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
         if round.is_multiple_of(2) {
             timed_prepared()?;
         }
-        // Rotate all five measurements to reduce systematic ordering effects.
+        let mut timed_borrowed = || -> ExperimentResult<()> {
+            let start = Instant::now();
+            let result = query_resources_prepared_borrowed(&f, &prepared_borrowed)?;
+            let elapsed = start.elapsed();
+            if result != reference {
+                return Err(
+                    io::Error::other("borrowed query result changed during experiment").into(),
+                );
+            }
+            black_box(result);
+            borrowed_samples.push(elapsed.as_secs_f64() * 1_000_000.0);
+            Ok(())
+        };
+        // Compare the owned and borrowed representations in alternating order.
+        if round.is_multiple_of(2) {
+            timed_borrowed()?;
+        }
+        // Rotate the original five measurements to reduce ordering effects.
         match round % 5 {
             0 => {
                 timed_query()?;
@@ -431,6 +473,7 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
         }
         if !round.is_multiple_of(2) {
             timed_prepared()?;
+            timed_borrowed()?;
         }
     }
 
@@ -441,7 +484,9 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
         trials,
         query_resource: summarize(query_samples),
         query_resource_prepared: summarize(prepared_samples),
+        query_resource_prepared_borrowed: summarize(borrowed_samples),
         snapshot_preparation_us,
+        borrowed_snapshot_preparation_us,
         rss_before_preparation_kib,
         rss_after_preparation_kib,
         exhaustive_authorization: summarize(exhaustive_samples),
@@ -451,8 +496,60 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
     })
 }
 
+/// One constructor per invocation to avoid simultaneously retaining both
+/// snapshot representations. Use a fresh OS process for each measurement.
+fn snapshot_memory_experiment(documents: usize, mode: &str) -> ExperimentResult<serde_json::Value> {
+    let f = fixture(documents)?;
+    let expected = individually_authorize(&f)?;
+    let before = process_rss_kib();
+    let (elapsed_us, after, allowed) = match mode {
+        "owned" => {
+            let start = Instant::now();
+            let snapshot =
+                PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())?;
+            let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+            let after = process_rss_kib();
+            let allowed = query_resources_prepared(&f, &snapshot)?;
+            black_box(&snapshot);
+            (elapsed_us, after, allowed)
+        }
+        "borrowed" => {
+            let start = Instant::now();
+            let snapshot = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)?;
+            let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+            let after = process_rss_kib();
+            let allowed = query_resources_prepared_borrowed(&f, &snapshot)?;
+            black_box(&snapshot);
+            (elapsed_us, after, allowed)
+        }
+        _ => return Err(io::Error::other("unknown snapshot memory mode").into()),
+    };
+    if allowed != expected {
+        return Err(io::Error::other("snapshot-memory query disagrees with reference").into());
+    }
+    Ok(json!({
+        "snapshot_mode": mode,
+        "documents": documents,
+        "authorized": expected.len(),
+        "snapshot_preparation_us": elapsed_us,
+        "rss_before_kib": before,
+        "rss_after_kib": after,
+        "note": "Whole-process VmRSS, not precise object allocation",
+    }))
+}
+
 fn main() -> ExperimentResult<()> {
     let args = Args::parse();
+    if let Some(mode) = args.snapshot_memory_mode.as_deref() {
+        if args.sizes.len() != 1 || args.sizes[0] == 0 {
+            return Err(io::Error::other("snapshot memory mode needs one positive size").into());
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot_memory_experiment(args.sizes[0], mode)?)?
+        );
+        return Ok(());
+    }
     if args.trials == 0 || args.sizes.is_empty() || args.sizes.contains(&0) {
         return Err(io::Error::other("trials and all entity sizes must be positive").into());
     }
@@ -500,6 +597,36 @@ mod tests {
                 expected
             );
             assert_eq!(query_resources(&f).expect("unprepared"), expected);
+        }
+    }
+
+    #[test]
+    fn snapshot_memory_modes_return_matching_authorized_counts() {
+        let owned = snapshot_memory_experiment(13, "owned").expect("owned");
+        let borrowed = snapshot_memory_experiment(13, "borrowed").expect("borrowed");
+        assert_eq!(owned["authorized"], borrowed["authorized"]);
+        assert_eq!(owned["documents"], borrowed["documents"]);
+        assert!(snapshot_memory_experiment(13, "invalid").is_err());
+    }
+
+    #[test]
+    fn borrowed_snapshot_matches_original_owned_and_exhaustive() {
+        for count in [1, 2, 7, 13, 100] {
+            let f = fixture(count).expect("fixture");
+            let borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
+                .expect("borrowed snapshot");
+            let owned = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+                .expect("owned snapshot");
+            let expected = individually_authorize(&f).expect("concrete baseline");
+            assert_eq!(
+                query_resources_prepared_borrowed(&f, &borrowed).expect("borrowed query"),
+                expected
+            );
+            assert_eq!(
+                query_resources_prepared(&f, &owned).expect("owned query"),
+                expected
+            );
+            assert_eq!(query_resources(&f).expect("original query"), expected);
         }
     }
 

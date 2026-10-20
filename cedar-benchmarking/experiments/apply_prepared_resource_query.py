@@ -40,6 +40,33 @@ impl PreparedResourceQueryEntities {
     }
 }
 
+/// Prepared permission-query snapshot borrowing a caller-managed, immutable
+/// concrete entity store and schema. Rust's shared references prevent mutation
+/// of these inputs while this snapshot remains alive.
+///
+/// Only the validated partial representation is stored as owned additional
+/// state; the caller is responsible for the lifetime of the source entities.
+#[doc = include_str!("../../experimental_warning.md")]
+#[derive(Debug)]
+pub struct BorrowedPreparedResourceQueryEntities<'a> {
+    entities: &'a Entities,
+    schema: &'a Schema,
+    partial_entities: PartialEntities,
+}
+
+impl<'a> BorrowedPreparedResourceQueryEntities<'a> {
+    /// Validate and prepare against references to the original entity store.
+    pub fn new(entities: &'a Entities, schema: &'a Schema) -> Result<Self, PermissionQueryError> {
+        schema.0.check_complete().map_err(tpe_err::TpeError::from)?;
+        let partial_entities = PartialEntities::from_concrete(entities.clone(), schema)?;
+        Ok(Self {
+            entities,
+            schema,
+            partial_entities,
+        })
+    }
+}
+
 """
 
 ORIGINAL = """        let partial_entities = PartialEntities::from_concrete(entities.clone(), schema)?;
@@ -63,6 +90,22 @@ REPLACEMENT = """        let partial_entities = PartialEntities::from_concrete(e
             request,
             &prepared.entities,
             &prepared.schema,
+            &prepared.partial_entities,
+        )
+    }
+
+    /// Query with an immutable borrowed snapshot and a cached validated
+    /// partial-entity representation; see `BorrowedPreparedResourceQueryEntities`.
+    #[doc = include_str!("../../experimental_warning.md")]
+    pub fn query_resource_prepared_borrowed(
+        &self,
+        request: &ResourceQueryRequest,
+        prepared: &BorrowedPreparedResourceQueryEntities<'_>,
+    ) -> Result<impl Iterator<Item = EntityUid>, PermissionQueryError> {
+        self.query_resource_impl(
+            request,
+            prepared.entities,
+            prepared.schema,
             &prepared.partial_entities,
         )
     }

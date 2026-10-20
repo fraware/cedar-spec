@@ -38,15 +38,24 @@ def measure(sizes: list[int], executable: Path, trials: int, warmups: int) -> di
         row = rows[0]
         if row.get("trials") != trials:
             raise ValueError(f"wrong trial count for {size}")
-        for key in ("query_resource", "query_resource_prepared", "snapshot_preparation_us"):
+        required = (
+            "query_resource",
+            "query_resource_prepared",
+            "query_resource_prepared_borrowed",
+            "snapshot_preparation_us",
+            "borrowed_snapshot_preparation_us",
+        )
+        for key in required:
             if key not in row:
                 raise ValueError(f"missing field {key} for size {size}")
 
         original = row["query_resource"]["mean_us"]
         prepared = row["query_resource_prepared"]["mean_us"]
+        borrowed = row["query_resource_prepared_borrowed"]["mean_us"]
         preparation = row["snapshot_preparation_us"]
+        borrowed_preparation = row["borrowed_snapshot_preparation_us"]
         if not all(isinstance(v, (int, float)) and 0 <= v < float("inf")
-                   for v in (original, prepared, preparation)):
+                   for v in (original, prepared, borrowed, preparation, borrowed_preparation)):
             raise ValueError(f"invalid timing result for {size}")
         speedup = original / prepared if prepared > 0 else None
         rss_start = row.get("rss_before_preparation_kib")
@@ -61,6 +70,8 @@ def measure(sizes: list[int], executable: Path, trials: int, warmups: int) -> di
             "measurements": row,
             "derived": {
                 "mean_speedup": speedup,
+                "borrowed_mean_speedup": original / borrowed if borrowed > 0 else None,
+                "borrowed_to_owned_query_ratio": borrowed / prepared if prepared > 0 else None,
                 "rss_change_kib": rss_change,
                 "estimated_minimum_queries_to_amortize": (
                     math.floor(preparation / (original - prepared)) + 1
@@ -72,7 +83,8 @@ def measure(sizes: list[int], executable: Path, trials: int, warmups: int) -> di
         })
         print(
             f"documents={size} original={original:.3f}us "
-            f"prepared={prepared:.3f}us speedup={speedup!r} "
+            f"prepared={prepared:.3f}us borrowed={borrowed:.3f}us "
+            f"speedup={speedup!r} "
             f"rss_delta={rss_change}KiB",
             flush=True,
         )

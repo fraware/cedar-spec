@@ -62,6 +62,9 @@ jobs:
       - name: Check isolated-process benchmark harness
         working-directory: ./cedar-spec
         run: python3 -m unittest discover -s cedar-benchmarking/experiments -p 'test_run_isolated_permission_query.py' -v
+      - name: Check borrowed-snapshot memory harness
+        working-directory: ./cedar-spec
+        run: python3 -m unittest discover -s cedar-benchmarking/experiments -p 'test_run_borrowed_memory_comparison.py' -v
       - name: Check permission-query benchmark correctness
         working-directory: ./cedar-spec/cedar-benchmarking
         run: cargo test --release --bin permission_query_baseline
@@ -75,5 +78,14 @@ jobs:
         with:
           name: cedar-prepared-query-isolated-raw
           path: ./cedar-spec/cedar-benchmarking/permission_query_isolated_results.json
+          if-no-files-found: error
+      - name: Compare owned and borrowed snapshot memory in separate processes
+        working-directory: ./cedar-spec/cedar-benchmarking
+        run: python3 experiments/run_borrowed_memory_comparison.py --sizes 100 1000 10000 --repetitions 4
+      - name: Preserve borrowed-vs-owned raw memory evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cedar-borrowed-vs-owned-memory-raw
+          path: ./cedar-spec/cedar-benchmarking/borrowed_vs_owned_memory.json
           if-no-files-found: error
 

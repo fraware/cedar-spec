@@ -13,7 +13,9 @@ def fake_result(size):
         "trials": 3,
         "query_resource": {"mean_us": 120.0},
         "query_resource_prepared": {"mean_us": 60.0},
+        "query_resource_prepared_borrowed": {"mean_us": 54.0},
         "snapshot_preparation_us": 180.0,
+        "borrowed_snapshot_preparation_us": 120.0,
         "rss_before_preparation_kib": 7000,
         "rss_after_preparation_kib": 7150,
     }
@@ -29,6 +31,8 @@ class IsolatedBenchTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertEqual([r["size"] for r in report["results"]], [100, 1000])
         self.assertEqual(report["results"][0]["derived"]["mean_speedup"], 2)
+        self.assertAlmostEqual(report["results"][0]["derived"]["borrowed_mean_speedup"], 120 / 54)
+        self.assertEqual(report["results"][0]["derived"]["borrowed_to_owned_query_ratio"], 0.9)
         self.assertEqual(report["results"][0]["derived"]["rss_change_kib"], 150)
         self.assertEqual(report["results"][0]["derived"]["estimated_minimum_queries_to_amortize"], 4)
         self.assertEqual(report["protocol"], "isolated-one-process-per-workload-size")

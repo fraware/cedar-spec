@@ -35,11 +35,18 @@ jobs:
         with:
           repository: cedar-policy/cedar
           path: ./cedar-spec/cedar
-          ref: ${{ inputs.cedar_policy_ref }}
+          # Pin to the source blob checked by apply_prepared_resource_query.py.
+          ref: 10b7222f01489cc1546607d8d8981747b61310f3
+      - name: Apply revision-locked Cedar prepared-snapshot prototype
+        working-directory: ./cedar-spec
+        run: python3 cedar-benchmarking/experiments/apply_prepared_resource_query.py cedar
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install protobuf-compiler
       - name: Prepare Rust build
         run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }} && rustup component add rustfmt clippy
+      - name: Check experimental Cedar source formatting
+        working-directory: ./cedar-spec/cedar
+        run: cargo fmt --all --check
       - name: cargo fmt
         working-directory: ./cedar-spec/cedar-benchmarking
         run: cargo fmt --all --check
@@ -52,7 +59,21 @@ jobs:
       - name: Run mini benchmark
         working-directory: ./cedar-spec/cedar-benchmarking
         run: cargo run --release -- --corpus corpus/tasks.json --trials 10 --output table
-      - name: Check permission-query benchmark correctness and execution
+      - name: Check isolated-process benchmark harness
+        working-directory: ./cedar-spec
+        run: python3 -m unittest discover -s cedar-benchmarking/experiments -p 'test_run_isolated_permission_query.py' -v
+      - name: Check permission-query benchmark correctness
         working-directory: ./cedar-spec/cedar-benchmarking
-        run: cargo test --release --bin permission_query_baseline && cargo run --release --bin permission_query_baseline -- --sizes 100,1000,10000 --warmups 3 --trials 30
+        run: cargo test --release --bin permission_query_baseline
+      - name: Run isolated prepared-query benchmarks
+        working-directory: ./cedar-spec/cedar-benchmarking
+        env:
+          CEDAR_SOURCE_REVISION: 10b7222f01489cc1546607d8d8981747b61310f3
+        run: python3 experiments/run_isolated_permission_query.py --sizes 100 1000 10000 --trials 30 --warmups 3
+      - name: Preserve raw isolated benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cedar-prepared-query-isolated-raw
+          path: ./cedar-spec/cedar-benchmarking/permission_query_isolated_results.json
+          if-no-files-found: error
 

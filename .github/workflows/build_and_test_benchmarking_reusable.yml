@@ -27,7 +27,7 @@ jobs:
       - name: Checkout cedar-spec
         uses: actions/checkout@v7
         with:
-          repository: cedar-policy/cedar-spec
+          repository: ${{ github.repository }}
           ref: ${{ inputs.cedar_spec_ref }}
           path: ./cedar-spec
       - name: Checkout cedar
@@ -52,3 +52,7 @@ jobs:
       - name: Run mini benchmark
         working-directory: ./cedar-spec/cedar-benchmarking
         run: cargo run --release -- --corpus corpus/tasks.json --trials 10 --output table
+      - name: Check permission-query benchmark correctness and execution
+        working-directory: ./cedar-spec/cedar-benchmarking
+        run: cargo test --release --bin permission_query_baseline && cargo run --release --bin permission_query_baseline -- --sizes 100,1000,10000 --warmups 3 --trials 30
+

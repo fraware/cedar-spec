@@ -908,8 +908,7 @@ mod tests {
             BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
                 .expect("updated borrowed snapshot");
         assert_eq!(
-            query_resources_prepared_borrowed(&f, &borrowed_replacement)
-                .expect("updated borrowed"),
+            query_resources_prepared_borrowed(&f, &borrowed_replacement).expect("updated borrowed"),
             expected
         );
         // The original immutable snapshot still represents the old entity data;
@@ -926,8 +925,7 @@ mod tests {
         let mut f = fixture(30).expect("fixture");
         let borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
             .expect("borrowed snapshot");
-        let initial = query_resources_prepared_borrowed(&f, &borrowed)
-            .expect("original policies");
+        let initial = query_resources_prepared_borrowed(&f, &borrowed).expect("original policies");
         assert_eq!(
             initial,
             individually_authorize(&f).expect("original concrete authorization")
@@ -936,14 +934,14 @@ mod tests {
         f.policies = r#"permit(principal, action, resource);"#
             .parse()
             .expect("unconditional permit");
-        assert!(
-            Validator::new(f.schema.clone())
-                .validate(&f.policies, ValidationMode::Strict)
-                .validation_passed()
+        assert!(Validator::new(f.schema.clone())
+            .validate(&f.policies, ValidationMode::Strict)
+            .validation_passed());
+        let after = query_resources_prepared_borrowed(&f, &borrowed).expect("updated policies");
+        assert_eq!(
+            after,
+            individually_authorize(&f).expect("updated concrete authorization")
         );
-        let after = query_resources_prepared_borrowed(&f, &borrowed)
-            .expect("updated policies");
-        assert_eq!(after, individually_authorize(&f).expect("updated concrete authorization"));
         assert_ne!(after, initial, "policy update must affect query decisions");
         assert_eq!(after.len(), f.candidates.len());
     }

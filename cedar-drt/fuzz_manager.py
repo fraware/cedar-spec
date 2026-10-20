@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -59,7 +60,7 @@ STAT_RE = re.compile(
     r"#(\d+)\s+\w+\s+cov:\s*(\d+)\s+ft:\s*(\d+)\s+corp:\s*(\S+)\s+"
     r".*?exec/s:\s*(\d+)\s+rss:\s*(\S+)"
 )
-DONE_RE = re.compile(r"Done (\d+) runs in (\d+) second")
+DONE_RE = re.compile(r"^\s*Done (\d+) runs in (\d+) second")
 
 
 def parse_line(line: str, stats: FuzzStats):
@@ -225,6 +226,22 @@ def render(targets: dict[str, FuzzStats], term_width: int):
 
 # ─── Runner ──────────────────────────────────────────────────────────────────
 
+async def terminate_process_group(proc):
+    """Terminate Cargo's POSIX process group and reap the immediate child."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+
+
 async def run_target(
     name: str,
     label: str,
@@ -242,9 +259,11 @@ async def run_target(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=str(Path(__file__).parent),
+        start_new_session=True,
     )
 
     output_lines: list[str] = []
+    completed = False
     assert proc.stdout is not None
     try:
         while True:
@@ -254,21 +273,66 @@ async def run_target(
             decoded = line.decode("utf-8", errors="replace")
             output_lines.append(decoded)
             parse_line(decoded, stats)
+            if DONE_RE.search(decoded):
+                completed = True
         await proc.wait()
     except asyncio.CancelledError:
         stats.status = "stopped"
-        if proc.returncode is None:
-            proc.terminate()
-            await proc.wait()
+        await terminate_process_group(proc)
         return
+    except Exception:
+        # Fail-closed reporting happens in the caller; first stop any Cargo,
+        # fuzz target, or solver processes still associated with this run.
+        await terminate_process_group(proc)
+        raise
 
-    if proc.returncode != 0 and stats.status != "done":
+    # The subprocess exit status is authoritative. A libFuzzer "Done" line
+    # can precede a nonzero exit, and a successful launch with zero iterations
+    # does not establish that the fuzz target was exercised.
+    if proc.returncode != 0 or stats.runs == 0 or not completed:
+        stats.status = "error"
+        if proc.returncode != 0:
+            reason = f"Fuzz target exited with status {proc.returncode}"
+        elif stats.runs == 0:
+            reason = "Fuzz target completed without executing any inputs"
+        else:
+            reason = "Fuzz target exited without a libFuzzer completion message"
+        report_path = reports_dir / f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        report_path.write_text("".join(output_lines) + f"\n{reason}\n")
+        stats.report_path = str(report_path)
+    else:
+        stats.status = "done"
+
+
+async def run_target_with_error_reporting(
+    name: str,
+    label: str,
+    stats: FuzzStats,
+    timeout: int | None,
+    reports_dir: Path,
+    sanitizer: str,
+):
+    """Ensure unexpected runner errors are reported as target failures.
+
+    In particular, subprocess-launch errors must not be swallowed by
+    the manager's gather(..., return_exceptions=True).
+    """
+    try:
+        await run_target(name, label, stats, timeout, reports_dir, sanitizer)
+    except Exception:
         stats.status = "error"
         report_path = reports_dir / f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        report_path.write_text("".join(output_lines))
+        report_path.write_text(traceback.format_exc())
         stats.report_path = str(report_path)
-    elif stats.status != "error":
-        stats.status = "done"
+
+
+def completion_exit_code(targets: dict[str, FuzzStats], interrupted: bool) -> int:
+    """Never report success for an interrupted or incomplete fuzz campaign."""
+    if interrupted:
+        return 130
+    if not targets or any(stats.status != "done" for stats in targets.values()):
+        return 1
+    return 0
 
 
 async def display_loop(targets: dict[str, FuzzStats]):
@@ -351,8 +415,12 @@ async def main():
         stderr=asyncio.subprocess.PIPE,
         cwd=str(Path(__file__).parent),
     )
-    stdout, _ = await proc.communicate()
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        sys.exit(f"{RED}cargo fuzz list failed:{RESET}\n{stderr.decode(errors='replace')}")
     all_targets = stdout.decode().strip().splitlines()
+    if not all_targets:
+        sys.exit(f"{RED}cargo fuzz list returned no targets{RESET}")
 
     matched = []
     for p in args.matching:
@@ -404,7 +472,7 @@ async def main():
 
     async def run_with_sem(name: str, label: str, stats: FuzzStats):
         async with sem:
-            await run_target(name, label, stats, args.timeout, reports_dir, args.sanitizer)
+            await run_target_with_error_reporting(name, label, stats, args.timeout, reports_dir, args.sanitizer)
 
     display_task = asyncio.create_task(display_loop(targets))
     fuzz_tasks = [
@@ -444,13 +512,16 @@ async def main():
     sys.stdout.write("\n\n")
     sys.stdout.flush()
 
-    # Summary of errors
-    errors = {n: s for n, s in targets.items() if s.status == "error"}
-    if errors:
-        print(f"\n{RED}{BOLD}Errors ({len(errors)}):{RESET}")
-        for name, st in errors.items():
-            print(f"  ✗ {name}: {st.report_path}")
-        sys.exit(1)
+    # Report both explicit errors and incomplete runs. In particular, a
+    # canceled target is "stopped" (not "error") and must not exit as success.
+    incomplete = {n: s for n, s in targets.items() if s.status != "done"}
+    if incomplete:
+        print(f"\n{RED}{BOLD}Incomplete or failed targets ({len(incomplete)}):{RESET}")
+        for name, st in incomplete.items():
+            print(f"  ✗ {name}: {st.status}" + (f" ({st.report_path})" if st.report_path else ""))
+    code = completion_exit_code(targets, interrupted)
+    if code:
+        sys.exit(code)
 
 def reexec_in_tmux():
     """If tmux is available and we're not already inside a tmux session,

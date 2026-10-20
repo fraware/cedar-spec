@@ -21,8 +21,9 @@
 //! It measures two existing Cedar API paths against the same entity snapshot.
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, EntityUid, PartialEntities, PolicySet, Request,
-    ResourceQueryRequest, Schema, ValidationMode, Validator,
+    Authorizer, Context, Decision, Entities, EntityUid, PartialEntities, PolicySet,
+    PreparedResourceQueryEntities, Request, ResourceQueryRequest, Schema, ValidationMode,
+    Validator,
 };
 use clap::Parser;
 use serde::Serialize;
@@ -64,6 +65,21 @@ forbid(
 "#;
 
 type ExperimentResult<T> = Result<T, Box<dyn Error>>;
+
+fn parse_vm_rss_kib(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?;
+        let mut pieces = value.split_whitespace();
+        let kib = pieces.next()?.parse::<u64>().ok()?;
+        (pieces.next() == Some("kB")).then_some(kib)
+    })
+}
+
+/// Linux-only process resident set snapshot. Not a per-object allocation size;
+/// allocator reuse, other allocations, and previous experiments affect it.
+fn process_rss_kib() -> Option<u64> {
+    parse_vm_rss_kib(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
 
 #[derive(Debug, Parser)]
 #[command(about = "Compare Cedar query_resource with exhaustive in-memory authorization")]
@@ -171,6 +187,15 @@ fn query_resources(f: &Fixture) -> ExperimentResult<BTreeSet<EntityUid>> {
         .collect())
 }
 
+fn query_resources_prepared(
+    f: &Fixture,
+    prepared: &PreparedResourceQueryEntities,
+) -> ExperimentResult<BTreeSet<EntityUid>> {
+    Ok(f.policies
+        .query_resource_prepared(&f.query, prepared)?
+        .collect())
+}
+
 fn individually_authorize(f: &Fixture) -> ExperimentResult<BTreeSet<EntityUid>> {
     let authorizer = Authorizer::new();
     let mut allowed = BTreeSet::new();
@@ -243,6 +268,10 @@ struct Row {
     authorized: usize,
     trials: usize,
     query_resource: TimingSummary,
+    query_resource_prepared: TimingSummary,
+    snapshot_preparation_us: f64,
+    rss_before_preparation_kib: Option<u64>,
+    rss_after_preparation_kib: Option<u64>,
     exhaustive_authorization: TimingSummary,
     exhaustive_prebuilt_requests: TimingSummary,
     concrete_entities_clone: TimingSummary,
@@ -260,9 +289,19 @@ struct Output {
 
 fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResult<Row> {
     let f = fixture(documents)?;
+    let rss_before_preparation_kib = process_rss_kib();
+    let preparation_start = Instant::now();
+    let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())?;
+    let snapshot_preparation_us = preparation_start.elapsed().as_secs_f64() * 1_000_000.0;
+    let rss_after_preparation_kib = process_rss_kib();
     let reference = individually_authorize(&f)?;
     if individually_authorize_prebuilt(&f) != reference {
         return Err(io::Error::other("prepared and constructed requests disagree").into());
+    }
+    if query_resources_prepared(&f, &prepared)? != reference {
+        return Err(
+            io::Error::other("prepared query disagrees with exhaustive authorization").into(),
+        );
     }
     if query_resources(&f)? != reference {
         return Err(
@@ -272,6 +311,7 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
 
     for _ in 0..warmups {
         black_box(query_resources(&f)?);
+        black_box(query_resources_prepared(&f, &prepared)?);
         black_box(individually_authorize(&f)?);
         black_box(individually_authorize_prebuilt(&f));
         black_box(f.entities.clone());
@@ -282,6 +322,7 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
     }
 
     let mut query_samples = Vec::with_capacity(trials);
+    let mut prepared_samples = Vec::with_capacity(trials);
     let mut exhaustive_samples = Vec::with_capacity(trials);
     let mut prebuilt_samples = Vec::with_capacity(trials);
     let mut clone_samples = Vec::with_capacity(trials);
@@ -336,6 +377,20 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
             conversion_samples.push(elapsed.as_secs_f64() * 1_000_000.0);
             Ok(())
         };
+        let mut timed_prepared = || -> ExperimentResult<()> {
+            let start = Instant::now();
+            let result = query_resources_prepared(&f, &prepared)?;
+            let elapsed = start.elapsed();
+            if result != reference {
+                return Err(io::Error::other("prepared query result changed").into());
+            }
+            black_box(result);
+            prepared_samples.push(elapsed.as_secs_f64() * 1_000_000.0);
+            Ok(())
+        };
+        if round.is_multiple_of(2) {
+            timed_prepared()?;
+        }
         // Rotate all five measurements to reduce systematic ordering effects.
         match round % 5 {
             0 => {
@@ -374,6 +429,9 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
                 timed_clone();
             }
         }
+        if !round.is_multiple_of(2) {
+            timed_prepared()?;
+        }
     }
 
     Ok(Row {
@@ -382,6 +440,10 @@ fn experiment(documents: usize, trials: usize, warmups: usize) -> ExperimentResu
         authorized: reference.len(),
         trials,
         query_resource: summarize(query_samples),
+        query_resource_prepared: summarize(prepared_samples),
+        snapshot_preparation_us,
+        rss_before_preparation_kib,
+        rss_after_preparation_kib,
         exhaustive_authorization: summarize(exhaustive_samples),
         exhaustive_prebuilt_requests: summarize(prebuilt_samples),
         concrete_entities_clone: summarize(clone_samples),
@@ -404,7 +466,7 @@ fn main() -> ExperimentResult<()> {
         cedar_version: cedar_policy::get_sdk_version().to_string(),
         host_arch: std::env::consts::ARCH,
         host_os: std::env::consts::OS,
-        notes: "In-memory synthetic entities and fixed validated policies; no database I/O. Candidate IDs are precomputed. One exhaustive baseline constructs Requests during timing and another uses prepared Requests. The query path internally clones and converts the entity store. Conversion-only includes the concrete clone; standalone clone-only is reported separately. Timings are per complete candidate-set query or one whole-store transformation.",
+        notes: "Experimental Cedar source overlay. The snapshot owns concrete and partial entities. Timings exclude data generation and schema parsing; preparation is reported separately. Linux VmRSS before and after preparation is observational whole-process resident memory, not per-snapshot allocation: it is affected by allocator reuse and earlier workload sizes. Only a flat synthetic workload is timed; no production change or database I/O.",
         rows,
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
@@ -424,6 +486,295 @@ mod tests {
                 individually_authorize(&f).expect("concrete baseline")
             );
         }
+    }
+
+    #[test]
+    fn prepared_snapshot_matches_unprepared_query_and_authorizer() {
+        for count in [1, 2, 7, 13, 100] {
+            let f = fixture(count).expect("fixture");
+            let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+                .expect("validated snapshot");
+            let expected = individually_authorize(&f).expect("concrete authorization");
+            assert_eq!(
+                query_resources_prepared(&f, &prepared).expect("prepared"),
+                expected
+            );
+            assert_eq!(query_resources(&f).expect("unprepared"), expected);
+        }
+    }
+
+    #[test]
+    fn prepared_snapshot_preserves_all_allow_all_deny_and_scoped_permissions() {
+        for policy in [
+            r#"permit(principal, action, resource);"#,
+            r#"forbid(principal, action, resource);"#,
+            r#"permit(
+                principal == User::"alice",
+                action == Action::"view",
+                resource
+            );"#,
+        ] {
+            let mut f = fixture(100).expect("fixture");
+            f.policies = policy.parse().expect("policy syntax");
+            assert!(
+                Validator::new(f.schema.clone())
+                    .validate(&f.policies, ValidationMode::Strict)
+                    .validation_passed(),
+                "policy must validate: {policy}"
+            );
+            let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+                .expect("snapshot");
+            let expected = individually_authorize(&f).expect("concrete authorization");
+            assert_eq!(
+                query_resources_prepared(&f, &prepared).expect("prepared resource query"),
+                expected,
+                "prepared query disagrees for policy: {policy}"
+            );
+            assert_eq!(
+                query_resources(&f).expect("original resource query"),
+                expected,
+                "original query disagrees for policy: {policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_schema_is_rejected_during_snapshot_construction() {
+        let f = fixture(10).expect("fixture");
+        let wrong_schema = Schema::from_cedarschema_str("entity User;")
+            .expect("schema syntax")
+            .0;
+        assert!(PreparedResourceQueryEntities::new(f.entities, wrong_schema).is_err());
+    }
+
+    #[test]
+    fn hierarchy_membership_preserves_permission_queries() {
+        let mut f = fixture(21).expect("base fixture");
+        let (schema, _) = Schema::from_cedarschema_str(
+            r#"
+                entity Group;
+                entity Folder;
+                entity User in [Group];
+                entity Document in [Folder] {
+                    owner: User,
+                    isPublic: Bool,
+                    blocked: Bool
+                };
+                action view appliesTo {
+                    principal: [User],
+                    resource: [Document]
+                };
+            "#,
+        )
+        .expect("hierarchy schema");
+        let mut entities = vec![
+            json!({"uid":{"__entity":{"type":"Group","id":"reviewers"}},"attrs":{},"parents":[]}),
+            json!({"uid":{"__entity":{"type":"Folder","id":"shared"}},"attrs":{},"parents":[]}),
+            json!({"uid":{"__entity":{"type":"User","id":"alice"}},"attrs":{},
+                "parents":[{"__entity":{"type":"Group","id":"reviewers"}}]}),
+            json!({"uid":{"__entity":{"type":"User","id":"bob"}},"attrs":{},"parents":[]}),
+        ];
+        for i in 0..21 {
+            let parents = if i % 3 == 0 {
+                vec![json!({"__entity":{"type":"Folder","id":"shared"}})]
+            } else {
+                vec![]
+            };
+            entities.push(json!({
+                "uid":{"__entity":{"type":"Document","id":format!("document-{i}")}},
+                "attrs":{
+                    "owner":{"__entity":{"type":"User","id":"alice"}},
+                    "isPublic":false,
+                    "blocked":i % 7 == 0
+                },
+                "parents":parents
+            }));
+        }
+        f.schema = schema;
+        f.entities = Entities::from_json_str(
+            &serde_json::to_string(&entities).expect("entity json"),
+            Some(&f.schema),
+        )
+        .expect("hierarchical entities");
+        f.policies = r#"
+            permit(
+                principal in Group::"reviewers",
+                action == Action::"view",
+                resource in Folder::"shared"
+            );
+            forbid(principal, action, resource)
+                when { resource.blocked };
+        "#
+        .parse()
+        .expect("hierarchy policies");
+        assert!(Validator::new(f.schema.clone())
+            .validate(&f.policies, ValidationMode::Strict)
+            .validation_passed());
+        let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+            .expect("snapshot");
+        for principal in [r#"User::"alice""#, r#"User::"bob""#] {
+            f.principal = principal.parse().expect("principal");
+            f.query = ResourceQueryRequest::new(
+                f.principal.clone(),
+                f.action.clone(),
+                f.candidates[0].type_name().clone(),
+                Context::empty(),
+                &f.schema,
+            )
+            .expect("query");
+            let expected = individually_authorize(&f).expect("concrete");
+            assert_eq!(query_resources(&f).expect("original"), expected);
+            assert_eq!(
+                query_resources_prepared(&f, &prepared).expect("prepared"),
+                expected
+            );
+            if principal == r#"User::"alice""# {
+                assert!(!expected.is_empty());
+                assert!(expected.len() < f.candidates.len());
+            } else {
+                assert!(expected.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn changing_request_context_does_not_reuse_old_decisions() {
+        let mut f = fixture(20).expect("fixture");
+        let (schema, _) = Schema::from_cedarschema_str(
+            r#"
+                entity User;
+                entity Document {
+                    owner: User,
+                    isPublic: Bool,
+                    blocked: Bool
+                };
+                action view appliesTo {
+                    principal: [User],
+                    resource: [Document],
+                    context: { emergency: Bool }
+                };
+            "#,
+        )
+        .expect("context schema");
+        f.schema = schema;
+        f.policies = r#"
+            permit(principal, action == Action::"view", resource)
+                when { context.emergency };
+            forbid(principal, action == Action::"view", resource)
+                when { resource.blocked };
+        "#
+        .parse()
+        .expect("context policies");
+        assert!(Validator::new(f.schema.clone())
+            .validate(&f.policies, ValidationMode::Strict)
+            .validation_passed());
+        let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+            .expect("prepared context snapshot");
+        let mut previous = None;
+        for emergency in [false, true, false] {
+            let context = Context::from_json_value(
+                json!({"emergency": emergency}),
+                Some((&f.schema, &f.action)),
+            )
+            .expect("request context");
+            f.query = ResourceQueryRequest::new(
+                f.principal.clone(),
+                f.action.clone(),
+                f.candidates[0].type_name().clone(),
+                context.clone(),
+                &f.schema,
+            )
+            .expect("typed query");
+            let mut allowed = BTreeSet::new();
+            for candidate in &f.candidates {
+                let request = Request::new(
+                    f.principal.clone(),
+                    f.action.clone(),
+                    candidate.clone(),
+                    context.clone(),
+                    Some(&f.schema),
+                )
+                .expect("typed request");
+                if Authorizer::new()
+                    .is_authorized(&request, &f.policies, &f.entities)
+                    .decision()
+                    == Decision::Allow
+                {
+                    allowed.insert(candidate.clone());
+                }
+            }
+            assert_eq!(query_resources(&f).expect("original"), allowed);
+            assert_eq!(
+                query_resources_prepared(&f, &prepared).expect("prepared"),
+                allowed
+            );
+            if let Some(last) = previous {
+                assert_ne!(
+                    allowed, last,
+                    "changing context should change allowed resources"
+                );
+            }
+            previous = Some(allowed);
+        }
+    }
+
+    #[test]
+    fn changed_entity_snapshot_must_be_rebuilt() {
+        let mut f = fixture(21).expect("initial fixture");
+        let original_snapshot =
+            PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+                .expect("initial snapshot");
+        let first_result =
+            query_resources_prepared(&f, &original_snapshot).expect("initial prepared result");
+        assert!(!first_result.is_empty());
+
+        let mut updated = vec![
+            json!({"uid":{"__entity":{"type":"User","id":"alice"}},"attrs":{},"parents":[]}),
+            json!({"uid":{"__entity":{"type":"User","id":"bob"}},"attrs":{},"parents":[]}),
+        ];
+        for i in 0..21 {
+            updated.push(json!({
+                "uid":{"__entity":{"type":"Document","id":format!("document-{i}")}},
+                "attrs":{
+                    "owner":{"__entity":{"type":"User","id":"alice"}},
+                    "isPublic":true,
+                    "blocked":true
+                },
+                "parents":[]
+            }));
+        }
+        f.entities = Entities::from_json_str(
+            &serde_json::to_string(&updated).expect("updated JSON"),
+            Some(&f.schema),
+        )
+        .expect("updated entities");
+        let replacement = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
+            .expect("replacement snapshot");
+        let expected = individually_authorize(&f).expect("updated concrete authorization");
+        assert!(expected.is_empty());
+        assert_eq!(query_resources(&f).expect("unprepared update"), expected);
+        assert_eq!(
+            query_resources_prepared(&f, &replacement).expect("updated prepared"),
+            expected
+        );
+        // The original immutable snapshot still represents the old entity data;
+        // it must be replaced to observe changed authorization attributes.
+        assert_eq!(
+            query_resources_prepared(&f, &original_snapshot).expect("old snapshot"),
+            first_result
+        );
+        assert_ne!(first_result, expected);
+    }
+
+    #[test]
+    fn process_rss_parser_rejects_unrelated_and_invalid_lines() {
+        assert_eq!(
+            parse_vm_rss_kib("VmSize: 2048 kB\nVmRSS: 4096 kB\n"),
+            Some(4096)
+        );
+        assert_eq!(parse_vm_rss_kib("VmRSS: unknown kB"), None);
+        assert_eq!(parse_vm_rss_kib("VmRSS: 45 MB"), None);
+        assert_eq!(parse_vm_rss_kib("VmSize: 4096 kB"), None);
     }
 
     #[test]

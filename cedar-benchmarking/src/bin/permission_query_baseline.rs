@@ -651,7 +651,14 @@ mod tests {
             );
             let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
                 .expect("snapshot");
+            let borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
+                .expect("borrowed snapshot");
             let expected = individually_authorize(&f).expect("concrete authorization");
+            assert_eq!(
+                query_resources_prepared_borrowed(&f, &borrowed).expect("borrowed resource query"),
+                expected,
+                "borrowed query disagrees for policy: {policy}"
+            );
             assert_eq!(
                 query_resources_prepared(&f, &prepared).expect("prepared resource query"),
                 expected,
@@ -671,6 +678,7 @@ mod tests {
         let wrong_schema = Schema::from_cedarschema_str("entity User;")
             .expect("schema syntax")
             .0;
+        assert!(BorrowedPreparedResourceQueryEntities::new(&f.entities, &wrong_schema).is_err());
         assert!(PreparedResourceQueryEntities::new(f.entities, wrong_schema).is_err());
     }
 
@@ -739,6 +747,8 @@ mod tests {
             .validation_passed());
         let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
             .expect("snapshot");
+        let borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
+            .expect("borrowed snapshot");
         for principal in [r#"User::"alice""#, r#"User::"bob""#] {
             f.principal = principal.parse().expect("principal");
             f.query = ResourceQueryRequest::new(
@@ -753,6 +763,10 @@ mod tests {
             assert_eq!(query_resources(&f).expect("original"), expected);
             assert_eq!(
                 query_resources_prepared(&f, &prepared).expect("prepared"),
+                expected
+            );
+            assert_eq!(
+                query_resources_prepared_borrowed(&f, &borrowed).expect("borrowed"),
                 expected
             );
             if principal == r#"User::"alice""# {
@@ -797,6 +811,8 @@ mod tests {
             .validation_passed());
         let prepared = PreparedResourceQueryEntities::new(f.entities.clone(), f.schema.clone())
             .expect("prepared context snapshot");
+        let borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
+            .expect("borrowed context snapshot");
         let mut previous = None;
         for emergency in [false, true, false] {
             let context = Context::from_json_value(
@@ -833,6 +849,10 @@ mod tests {
             assert_eq!(query_resources(&f).expect("original"), allowed);
             assert_eq!(
                 query_resources_prepared(&f, &prepared).expect("prepared"),
+                allowed
+            );
+            assert_eq!(
+                query_resources_prepared_borrowed(&f, &borrowed).expect("borrowed"),
                 allowed
             );
             if let Some(last) = previous {
@@ -884,6 +904,14 @@ mod tests {
             query_resources_prepared(&f, &replacement).expect("updated prepared"),
             expected
         );
+        let borrowed_replacement =
+            BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
+                .expect("updated borrowed snapshot");
+        assert_eq!(
+            query_resources_prepared_borrowed(&f, &borrowed_replacement)
+                .expect("updated borrowed"),
+            expected
+        );
         // The original immutable snapshot still represents the old entity data;
         // it must be replaced to observe changed authorization attributes.
         assert_eq!(
@@ -891,6 +919,33 @@ mod tests {
             first_result
         );
         assert_ne!(first_result, expected);
+    }
+
+    #[test]
+    fn borrowed_snapshot_reuses_entities_without_caching_policy_decisions() {
+        let mut f = fixture(30).expect("fixture");
+        let borrowed = BorrowedPreparedResourceQueryEntities::new(&f.entities, &f.schema)
+            .expect("borrowed snapshot");
+        let initial = query_resources_prepared_borrowed(&f, &borrowed)
+            .expect("original policies");
+        assert_eq!(
+            initial,
+            individually_authorize(&f).expect("original concrete authorization")
+        );
+
+        f.policies = r#"permit(principal, action, resource);"#
+            .parse()
+            .expect("unconditional permit");
+        assert!(
+            Validator::new(f.schema.clone())
+                .validate(&f.policies, ValidationMode::Strict)
+                .validation_passed()
+        );
+        let after = query_resources_prepared_borrowed(&f, &borrowed)
+            .expect("updated policies");
+        assert_eq!(after, individually_authorize(&f).expect("updated concrete authorization"));
+        assert_ne!(after, initial, "policy update must affect query decisions");
+        assert_eq!(after.len(), f.candidates.len());
     }
 
     #[test]

@@ -79,6 +79,7 @@ jobs:
     uses: ./.github/workflows/build_and_test_drt_reusable.yml
     with:
       cedar_spec_repository: ${{ github.repository }}
+      run_fuzz_smoke: true
       cedar_spec_ref: ${{ github.ref }}
       cedar_policy_ref: ${{ needs.get-branch-name.outputs.branch_name }}
 
@@ -150,3 +151,12 @@ jobs:
       cedar_spec_repository: ${{ github.repository }}
       cedar_spec_ref: ${{ github.ref }}
       cedar_policy_ref: ${{ needs.get-branch-name.outputs.branch_name }}
+
+  test_smoke_fuzz_runner:
+    name: Smoke-fuzz runner unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cedar-spec
+        uses: actions/checkout@v7
+      - name: Test target accounting and failure reporting
+        run: python3 -m unittest discover -s cedar-drt -p 'test_smoke_fuzz.py' -v
